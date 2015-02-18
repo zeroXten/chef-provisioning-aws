@@ -4,6 +4,7 @@ require 'chef_zero_rspec_helper'
 
 describe Chef::Provider::AwsEc2NetworkInterface do
   extend ChefZeroRspecHelper
+
   let(:new_resource) { 
     Chef::Resource::AwsEc2NetworkInterface.new('new_eni', run_context)
   }
@@ -28,11 +29,18 @@ describe Chef::Provider::AwsEc2NetworkInterface do
 
   when_the_chef_server 'is empty' do
     describe '#action_create' do
-      it 'should converge' do
+      it 'should create new network interface' do
         new_resource.subnet_id('subnet-6fab6818')
         new_resource.security_group_ids(['sg-52a8f837'])
         expect(new_resource).to receive(:save)
         provider.action_create
+      end
+    end
+
+    describe '#action_delete' do
+      it 'should delete network interface' do
+        expect(new_resource).to receive(:delete)
+        provider.action_delete
       end
     end
   end

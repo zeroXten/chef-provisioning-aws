@@ -15,6 +15,7 @@ Gem::Specification.new do |s|
   s.add_dependency 'chef', '>= 11.16.4'
   s.add_dependency 'chef-provisioning', '~> 0.9'
   s.add_dependency 'aws-sdk-v1'
+  s.add_dependency 'retryable'
 
   s.add_development_dependency 'rspec', '~> 3.0'
   s.add_development_dependency 'rake'

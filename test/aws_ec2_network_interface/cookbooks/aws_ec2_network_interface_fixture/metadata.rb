@@ -1,0 +1,1 @@
+name 'aws_ec2_network_interface_fixture'
