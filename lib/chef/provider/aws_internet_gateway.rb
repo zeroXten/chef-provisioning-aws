@@ -1,76 +1,84 @@
-require 'chef/provider/aws_provider'
+require 'chef/provisioning/aws_driver/aws_provider'
+require 'chef/resource/aws_vpc'
 
-class Chef::Provider::AwsInternetGateway < Chef::Provider::AwsProvider
+class Chef::Provider::AwsInternetGateway < Chef::Provisioning::AWSDriver::AWSProvider
 
   action :create do
-    unless current_resource
-      converge_by("Creating new Internet Gateway #{name} in #{new_driver.aws_config.region}") do
-        igw = new_driver.ec2.internet_gateways.create
-        igw.tags['Name'] = new_resource.name
-        new_resource.internet_gateway_id igw.id
-        new_resource.save
+    unless aws_object
+      converge_by("Creating new Internet Gateway #{name} in #{driver.aws_config.region}") do
+        self.aws_object = driver.ec2.internet_gateways.create
+        aws_object.tags['Name'] = name
+
+        new_resource.save_managed_entry(aws_object, action_handler)
       end
     end
 
-    if vpc_id && vpc_id != current_resource.vpc
-      converge_by("Attaching Internet Gateway to VPC #{vpc_id}") do
-        new_driver.ec2.client.attach_internet_gateway(
-          :internet_gateway_id => internet_gateway_id,
+    if vpc
+      if vpc.kind_of?(Chef::Resource::AwsVpc)
+        vpc_id = vpc.aws_object.id
+      else
+        # We could be provided the AWS id or the name of another resource
+        begin
+          r = new_resource.run_context.resource_collection.find(:aws_vpc => vpc)
+          vpc_id = r.aws_object.id
+        rescue Chef::Exceptions::ResourceNotFound
+          vpc_id = vpc
+        end
+      end
+      if aws_object.vpc.nil? || vpc_id != aws_object.vpc.id
+        # We know we need to update the current vpc_id, but we must detach an existing
+        # VPC if it is the wrong one
+        unless aws_object.attachments.empty?
+          converge_by("Detaching Internet Gateway from VPC #{aws_object.vpc.id} before reattaching") do
+            driver.ec2.client.detach_internet_gateway(
+              :internet_gateway_id => aws_object.id,
+              :vpc_id => aws_object.vpc.id
+            )
+          end
+        end
+        converge_by("Attaching Internet Gateway to VPC #{vpc_id}") do
+          driver.ec2.client.attach_internet_gateway(
+            :internet_gateway_id => aws_object.id,
+            :vpc_id => vpc_id
+          )
+        end
+      end
+    end
+
+  end
+
+  action :detach do
+    if aws_object && aws_object.vpc && !(vpc_id=aws_object.vpc.id).nil?
+      converge_by("Detaching Internet Gateway from VPC #{vpc_id}") do
+        driver.ec2.client.detach_internet_gateway(
+          :internet_gateway_id => aws_object.id,
           :vpc_id => vpc_id
         )
       end
     end
   end
 
-  action :detach do
-    if current_resource && current_resource.vpc
-      converge_by("Detaching Internet Gateway #{name} from VPC #{current_resource.vpc}") do
-        new_driver.ec2.client.detach_internet_gateway(
-          :internet_gateway_id => internet_gateway_id,
-          :vpc_id => current_resource.vpc
-        )
-      end
-    end
-  end
-
   action :delete do
-    if current_resource
+    if aws_object
       converge_by("Deleting Internet Gateway #{name}") do
-        new_driver.ec2.client.delete_internet_gateway(:internet_gateway_id => internet_gateway_id)
+        aws_object.delete
       end
     end
-    new_resource.delete
-  end
-
-  def load_current_resource
-    current_resource = Chef::Resource::AwsInternetGateway.new(new_resource.name, new_resource.run_context)
-    return nil unless current_resource && current_resource.internet_gateway_id
-    aws_resource = new_driver.ec2.internet_gateways[current_resource.internet_gateway_id]
-    return nil unless aws_resource.exists?
-    unless aws_resource.attachments.empty?
-      current_resource.vpc aws_resource.attachments[0].vpc.id
-    end
-    @current_resource = current_resource
-  end
-
-  # TODO on the update can you specify either vpc_id or vpc_name?
-
-  def vpc_id
-    return nil unless new_resource.vpc
-    if new_resource.vpc.is_a?(String)
-      return new_resource.vpc
-    end
-    return new_resource.vpc.vpc_id
+    new_resource.delete_managed_entry(action_handler)
   end
 
   def name
     new_resource.name
   end
 
-  def internet_gateway_id
-    new_resource.internet_gateway_id
+  def vpc
+    new_resource.vpc
   end
 
-  alias_method :id, :internet_gateway_id
+  def aws_object
+    @aws_object ||= new_resource.aws_object
+  end
+
+  attr_writer :aws_object
 
 end

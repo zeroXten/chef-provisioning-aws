@@ -47,7 +47,8 @@ module AWSDriver
       region = nil if region && region.empty?
 
       credentials = profile_name ? aws_credentials[profile_name] : aws_credentials.default
-      @aws_config = AWS::Core::Configuration.new(
+      # Need to reference the global config so settings supplied later will be combined
+      @aws_config = AWS.config(
         access_key_id:     credentials[:aws_access_key_id],
         secret_access_key: credentials[:aws_secret_access_key],
         region: region || credentials[:region]
