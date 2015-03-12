@@ -11,8 +11,6 @@ class Chef::Resource::AwsInternetGateway < Chef::Provisioning::AWSDriver::AWSRes
   attribute :name, kind_of: String, name_attribute: true
   attribute :vpc, kind_of: [String, Chef::Resource::AwsVpc]
 
-  # TODO test loading and modifying the resource if name is AWS SHA
-  # TODO test specifying both name and internet_gateway_id to move an unmanaged entry to a managed entry
   attribute :internet_gateway_id, kind_of: String, aws_id_attribute: true, lazy_default: proc {
     name =~ /^igw-[a-f0-9]{8}$/ ? name : nil
   }
