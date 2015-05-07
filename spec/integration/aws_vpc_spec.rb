@@ -1,331 +1,109 @@
 require 'spec_helper'
-require 'cheffish/rspec/chef_run_support'
-require 'chef/provisioning/aws_driver/credentials'
 
-describe 'Aws VPC' do
-  extend Cheffish::RSpec::ChefRunSupport
+describe Chef::Resource::AwsVpc do
+  extend AWSSupport
 
-  when_the_chef_12_server "exists" do
-    organization 'foo'
-
-    let(:ec2_client) { double(AWS::EC2::Client) }
-    let!(:entry_store) { Chef::Provisioning::ChefManagedEntryStore.new }
-
-    before :each do
-      Chef::Config.chef_server_url = URI.join(Chef::Config.chef_server_url, '/organizations/foo').to_s
-      allow_any_instance_of(AWS.config.class).to receive(:ec2_client).and_return(ec2_client)
-      allow(Chef::Provisioning::ChefManagedEntryStore).to receive(:new).and_return(entry_store)
-      allow_any_instance_of(Chef::Provisioning::AWSDriver::Credentials).to receive(:default)
-        .and_return({
-          :aws_access_key_id => 'na',
-          :aws_secret_access_key => 'na'
-        })
-    end
-
-    let(:vpc_id) { "foo" }
-
-    describe "action :create" do
-
-      let(:create_hash) do
-        {
-          :cidr_block=>"10.0.31.0/24",
-          :instance_tenancy=>"default"
-        }
-      end
-      let(:create_resp) do
-        resp = AWS::Core::Response.new
-        resp.data[:vpc] = {
-          :tag_set=>[],
-          :vpc_id=>vpc_id,
-          :cidr_block=>"10.0.31.0/24",
-          :instance_tenancy=>"default"
-        }
-        resp
+  when_the_chef_12_server "exists", organization: 'foo', server_scope: :context do
+    with_aws "When AWS has a DHCP options" do
+      # Empty DHCP options for the purposes of associating
+      aws_dhcp_options 'test_dhcp_options' do
       end
 
-      before do
-        expect(ec2_client).to receive(:create_vpc).with(create_hash).and_return(create_resp)
-        expect(ec2_client).to receive(:create_tags).with({
-          :resources=>[vpc_id],
-          :tags=>[{:key=>"Name", :value=>"my_vpc"}]
-        })
-
-        expect(entry_store).to receive(:save_data).with(
-          "aws_vpc",
-          "my_vpc",
-          {"reference"=>{"id"=>vpc_id}, "driver_url"=>"aws::us-west-2"},
-          kind_of(Chef::Provisioning::ActionHandler)
-        )
-      end
-
-      after do
-        expect(chef_run).to have_updated('aws_vpc[my_vpc]', :create)
-      end
-
-      context "simple object" do
-        it "creates the VPC" do
-          run_recipe do
-            with_driver 'aws::us-west-2'
-            aws_vpc 'my_vpc' do
-              cidr_block '10.0.31.0/24'
+      context "Creating an aws_vpc" do
+        it "aws_vpc 'vpc' with cidr_block '10.0.0.0/24' creates a VPC" do
+          expect_recipe {
+            aws_vpc 'test_vpc' do
+              cidr_block '10.0.0.0/24'
             end
-          end
+          }.to create_an_aws_vpc('test_vpc',
+            cidr_block: '10.0.0.0/24',
+            instance_tenancy: :default,
+            state: :available,
+            internet_gateway: nil
+          ).and be_idempotent
         end
-      end
 
-      context "internet gateway" do
-        let(:internet_gateway_id) {"stargate"}
-        before do
-          resp = AWS::Core::Response.new
-          resp.data[:internet_gateway_set] = []
-          expect(ec2_client).to receive(:describe_internet_gateways).exactly(2).times
-            .with({:filters=>[{:name=>"attachment.vpc-id", :values=>[vpc_id]}]})
-            .and_return(resp)
-          resp = AWS::Core::Response.new
-          resp.data[:internet_gateway] = {
-            :internet_gateway_id => internet_gateway_id
-          }
-          expect(ec2_client).to receive(:create_internet_gateway).and_return(resp)
-          expect(ec2_client).to receive(:create_tags).with({
-            :resources=>["stargate"],
-            :tags=>[{:key=>"OwnedByVPC", :value=>vpc_id}]
-          })
-          expect(ec2_client).to receive(:attach_internet_gateway)
-            .with({:internet_gateway_id=>"stargate", :vpc_id=>vpc_id})
-        end
-        it "creates the VPC" do
-          run_recipe do
-            with_driver 'aws::us-west-2'
-            aws_vpc 'my_vpc' do
-              cidr_block '10.0.31.0/24'
+        it "aws_vpc 'vpc' with all attributes creates a VPC" do
+          expect_recipe {
+            aws_vpc 'test_vpc' do
+              cidr_block '10.0.0.0/24'
               internet_gateway true
-            end
-          end
-        end
-      end
-
-      context "enable_dns_support" do
-        before do
-          resp = AWS::Core::Response.new
-          resp.data[:vpc_id] = vpc_id
-          resp.data[:enable_dns_support] = {:value => false}
-          resp.data[:enable_dns_hostnames] = {:value => false}
-          expect(ec2_client).to receive(:describe_vpc_attribute)
-            .with({:vpc_id=>vpc_id, :attribute=>"enableDnsSupport"})
-            .and_return(resp)
-          resp = AWS::Core::Response.new
-          expect(ec2_client).to receive(:modify_vpc_attribute)
-            .with({:vpc_id=>vpc_id, :enable_dns_support=>{:value=>true}})
-            .and_return(resp)
-        end
-        it "creates the VPC" do
-          run_recipe do
-            with_driver 'aws::us-west-2'
-            aws_vpc 'my_vpc' do
-              cidr_block '10.0.31.0/24'
+              instance_tenancy :dedicated
+              main_routes '0.0.0.0/0' => :internet_gateway
+              dhcp_options 'test_dhcp_options'
               enable_dns_support true
-            end
-          end
-        end
-      end
-
-      context "enable_dns_hostnames" do
-        before do
-          resp = AWS::Core::Response.new
-          resp.data[:vpc_id] = vpc_id
-          resp.data[:enable_dns_support] = {:value => false}
-          resp.data[:enable_dns_hostnames] = {:value => false}
-          expect(ec2_client).to receive(:describe_vpc_attribute)
-            .with({:vpc_id=>vpc_id, :attribute=>"enableDnsHostnames"})
-            .and_return(resp)
-          resp = AWS::Core::Response.new
-          expect(ec2_client).to receive(:modify_vpc_attribute)
-            .with({:vpc_id=>vpc_id, :enable_dns_hostnames=>{:value=>true}})
-            .and_return(resp)
-        end
-        it "creates the VPC" do
-          run_recipe do
-            with_driver 'aws::us-west-2'
-            aws_vpc 'my_vpc' do
-              cidr_block '10.0.31.0/24'
               enable_dns_hostnames true
             end
-          end
+          }.to create_an_aws_vpc('test_vpc',
+            cidr_block:       '10.0.0.0/24',
+            instance_tenancy: :dedicated,
+            dhcp_options_id:  test_dhcp_options.aws_object.id,
+            state:            :available,
+            "route_tables.main_route_table.routes" => [
+              {
+                destination_cidr_block: '10.0.0.0/24',
+                target: { id: 'local' }
+              },
+              {
+                destination_cidr_block: '0.0.0.0/0',
+                target: an_instance_of(AWS::EC2::InternetGateway)
+              }
+            ],
+            internet_gateway: an_instance_of(AWS::EC2::InternetGateway)
+          ).and be_idempotent
         end
       end
 
-    end
-
-    describe "when supplying an existing vpc_id" do
-      before do
-        resp = AWS::Core::Response.new
-        resp.data[:vpc_set] = [{
-          :vpc_id => 'vpc-123456',
-          :cidr_block => '10.0.31.0/24',
-          :state => 'created',
-          :dhcp_options_id => 'yggdrasil',
-          :tag_set => [],
-          :instance_tenancy => 'default',
-          :is_default => true
-        }]
-        resp.request_type = :describe_vpcs
-        expect(ec2_client).to receive(:describe_vpcs).exactly(2).times
-          .with({:vpc_ids=>['vpc-123456']})
-          .and_return(resp)
-      end
-      it "finds the VPC without updating it" do
-        run_recipe do
-          with_driver 'aws::us-west-2'
-          aws_vpc 'my_vpc' do
-            cidr_block '10.0.31.0/24'
-            vpc_id 'vpc-123456'
-          end
+      context "and an existing VPC with values filled in" do
+        aws_vpc 'test_vpc' do
+          cidr_block '10.0.0.0/24'
+          internet_gateway true
+          instance_tenancy :dedicated
+          main_routes '0.0.0.0/0' => :internet_gateway
+          dhcp_options 'test_dhcp_options'
+          enable_dns_support true
+          enable_dns_hostnames true
         end
-      end
 
-      it "errors when trying to update the cidr_block" do
-        expect {
-          run_recipe do
-            with_driver 'aws::us-west-2'
-            aws_vpc 'my_vpc' do
-              cidr_block '10.0.32.0/24'
-              vpc_id 'vpc-123456'
+        context "and a route table inside that VPC" do
+          aws_route_table 'test_route_table' do
+            vpc 'test_vpc'
+          end
+
+          it "aws_vpc can update the main_route_table to it" do
+            expect_recipe {
+              aws_vpc 'test_vpc' do
+                main_route_table 'test_route_table'
+              end
+            }.to update_an_aws_vpc('test_vpc',
+              "route_tables.main_route_table.id" => test_route_table.aws_object.id
+            ).and be_idempotent
+          end
+
+          # Clean up the main route table association so we can cleanly delete
+          before :each do
+            @old_main = test_vpc.aws_object.route_tables.main_route_table
+          end
+          after :each do
+            new_main = test_vpc.aws_object.route_tables.main_route_table
+            if new_main != @old_main
+              main_association = new_main.associations.select { |a| a.main? }.first
+              if main_association
+                test_vpc.aws_object.client.replace_route_table_association(
+                  association_id: main_association.id,
+                  route_table_id: @old_main.id)
+              end
             end
           end
-        }.to raise_exception(/VPC CIDR blocks cannot currently be changed!/)
+        end
       end
 
-      it "errors when trying to update the instance_tenancy" do
-        expect {
-          run_recipe do
-            with_driver 'aws::us-west-2'
-            aws_vpc 'my_vpc' do
-              cidr_block '10.0.31.0/24'
-              instance_tenancy :dedicated
-              vpc_id 'vpc-123456'
-            end
+      it "aws_vpc 'vpc' with no attributes fails to create a VPC (must specify cidr_block)" do
+        expect_recipe {
+          aws_vpc 'test_vpc' do
           end
-        }.to raise_exception(/Instance tenancy of VPCs cannot be changed!/)
+        }.to be_up_to_date
       end
-
-      it "successfully updates attributes" do
-        resp = AWS::Core::Response.new
-        resp.data[:vpc_id] = vpc_id
-        resp.data[:enable_dns_hostnames] = {:value => false}
-        expect(ec2_client).to receive(:describe_vpc_attribute)
-          .with({:vpc_id=>'vpc-123456', :attribute=>"enableDnsHostnames"})
-          .and_return(resp)
-        resp = AWS::Core::Response.new
-        expect(ec2_client).to receive(:modify_vpc_attribute)
-          .with({:vpc_id=>'vpc-123456', :enable_dns_hostnames=>{:value=>true}})
-          .and_return(resp)
-        run_recipe do
-          with_driver 'aws::us-west-2'
-          aws_vpc 'my_vpc' do
-            cidr_block '10.0.31.0/24'
-            enable_dns_hostnames true
-            vpc_id 'vpc-123456'
-          end
-        end
-      end
-    end
-
-    describe "action :delete" do
-      let(:ig_id) {"bar"}
-
-      shared_examples "deletes VPC" do
-        it "deletes VPC" do
-          resp = {"id"=>"my_vpc", "reference"=>{"id"=>"foo"}, "driver_url"=>"aws::us-west-2"}
-          expect(entry_store).to receive(:get_data).with(:aws_vpc, "my_vpc").and_return(resp)
-          expect(ec2_client).to receive(:describe_vpcs).with({:vpc_ids=>[vpc_id]}).and_return(true)
-          expect(ec2_client).to receive(:delete_vpc).with({:vpc_id=>vpc_id})
-
-          run_recipe do
-            with_driver 'aws::us-west-2'
-            aws_vpc 'my_vpc' do
-              action :delete
-            end
-          end
-
-          expect(chef_run).to have_updated('aws_vpc[my_vpc]', :delete)
-        end
-      end
-
-      context "no internet gateway" do
-        before do
-          resp = AWS::Core::Response.new
-          resp.data[:internet_gateway_set] = []
-          expect(ec2_client).to receive(:describe_internet_gateways)
-            .with({:filters=>[{:name=>"attachment.vpc-id", :values=>[vpc_id]}]})
-            .and_return(resp)
-        end
-        include_examples "deletes VPC"
-      end
-
-      context "a managed Internet Gateway" do
-        before do
-          resp = AWS::Core::Response.new
-          resp.data[:internet_gateway_set] = [{
-            :internet_gateway_id => ig_id
-          }]
-          expect(ec2_client).to receive(:describe_internet_gateways)
-            .with({:filters=>[{:name=>"attachment.vpc-id", :values=>[vpc_id]}]})
-            .and_return(resp)
-          expect(ec2_client).to receive(:detach_internet_gateway).with({
-            :internet_gateway_id=>ig_id,
-            :vpc_id=>vpc_id
-          })
-          tag = {
-            :resource_id => ig_id,
-            :resource_type => "internet-gateway",
-            :key => "OwnedByVPC",
-            :value => vpc_id
-          }
-          resp = AWS::Core::Response.new
-          resp.data[:tag_set] = [tag]
-          resp.data[:tag_index] = {
-            "internet-gateway:#{ig_id}:OwnedByVPC" => tag
-          }
-          resp.request_type = :describe_tags
-          resp.tag_index["internet-gateway:bar:OwnedByVPC"]
-          expect(ec2_client).to receive(:describe_tags).with({
-            :filters=>[
-              {:name=>"key", :values=>["OwnedByVPC"]},
-              {:name=>"resource-type", :values=>["internet-gateway"]},
-              {:name=>"resource-id", :values=>[ig_id]}
-            ]
-          }).and_return(resp)
-          expect(ec2_client).to receive(:delete_internet_gateway).with({:internet_gateway_id=>ig_id})
-        end
-        include_examples "deletes VPC"
-      end
-
-      context "an unmanaged Internet Gateway" do
-        before do
-          resp = AWS::Core::Response.new
-          resp.data[:internet_gateway_set] = [{
-            :internet_gateway_id => ig_id
-          }]
-          expect(ec2_client).to receive(:describe_internet_gateways)
-            .with({:filters=>[{:name=>"attachment.vpc-id", :values=>[vpc_id]}]})
-            .and_return(resp)
-          expect(ec2_client).to receive(:detach_internet_gateway).with({
-            :internet_gateway_id=>ig_id,
-            :vpc_id=>vpc_id
-          })
-          resp = AWS::Core::Response.new
-          resp.data[:tag_set] = []
-          expect(ec2_client).to receive(:describe_tags).with({
-            :filters=>[
-              {:name=>"key", :values=>["OwnedByVPC"]},
-              {:name=>"resource-type", :values=>["internet-gateway"]},
-              {:name=>"resource-id", :values=>[ig_id]}
-            ]
-          }).and_return(resp)
-        end
-        include_examples "deletes VPC"
-      end
-
     end
   end
 end

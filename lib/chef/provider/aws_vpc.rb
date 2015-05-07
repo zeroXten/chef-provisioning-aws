@@ -1,15 +1,12 @@
 require 'chef/provisioning/aws_driver/aws_provider'
 require 'date'
+require 'chef/provisioning'
+require 'retryable'
 
 class Chef::Provider::AwsVpc < Chef::Provisioning::AWSDriver::AWSProvider
 
-  action :create do
-    vpc = new_resource.aws_object
-    if vpc
-      update_vpc(vpc)
-    else
-      vpc = create_vpc
-    end
+  def action_create
+    vpc = super
 
     # Update DNS attributes
     update_vpc_attributes(vpc)
@@ -23,12 +20,12 @@ class Chef::Provider::AwsVpc < Chef::Provisioning::AWSDriver::AWSProvider
 
     # Replace the main route table for the VPC
     if !new_resource.main_route_table.nil?
-      main_route_table = update_main_route_table(vpc)
+      update_main_route_table(vpc)
     end
 
     # Update the main route table
     if !new_resource.main_routes.nil?
-      update_main_routes(vpc, main_route_table)
+      update_main_routes(vpc, new_resource.main_route_table)
     end
 
     # Update DHCP options
@@ -37,45 +34,20 @@ class Chef::Provider::AwsVpc < Chef::Provisioning::AWSDriver::AWSProvider
     end
   end
 
-  action :delete do
-    aws_object = new_resource.aws_object
-    if aws_object
-      ig = aws_object.internet_gateway
-      if ig
-        converge_by "detach Internet Gateway #{ig.id} in #{region} from VPC #{new_resource.name} (#{aws_object.id}" do
-          ig.detach(aws_object.id)
-        end
-        if ig.tags['OwnedByVPC'] == aws_object.id
-          converge_by "destroy Internet Gateway #{ig.id} in #{region} (owned by VPC #{new_resource.name} (#{aws_object.id}))" do
-            ig.delete
-          end
-        end
-      end
-      # TODO delete main route table & routes if they exist
-      # TODO (?) detach dhcp options
-      converge_by "delete VPC #{aws_object.id} in #{region}" do
-        aws_object.delete
-      end
-    end
+  protected
 
-    new_resource.delete_managed_entry(action_handler)
-  end
+  def create_aws_object
+    options = { }
+    options[:instance_tenancy] = new_resource.instance_tenancy if new_resource.instance_tenancy
 
-  private
-
-  def create_vpc
-    vpc = nil
     converge_by "create new VPC #{new_resource.name} in #{region}" do
-      opts = { }
-      opts[:instance_tenancy] = new_resource.instance_tenancy if new_resource.instance_tenancy
-      vpc = driver.ec2.vpcs.create(new_resource.cidr_block, opts)
+      vpc = new_resource.driver.ec2.vpcs.create(new_resource.cidr_block, options)
       vpc.tags['Name'] = new_resource.name
+      vpc
     end
-    new_resource.save_managed_entry(vpc, action_handler)
-    vpc
   end
 
-  def update_vpc(vpc)
+  def update_aws_object(vpc)
     if new_resource.instance_tenancy && new_resource.instance_tenancy != vpc.instance_tenancy
       raise "Tenancy of VPC #{new_resource.name} is #{vpc.instance_tenancy}, but desired tenancy is #{new_resource.instance_tenancy}.  Instance tenancy of VPCs cannot be changed!"
     end
@@ -83,6 +55,61 @@ class Chef::Provider::AwsVpc < Chef::Provisioning::AWSDriver::AWSProvider
       raise "CIDR block of VPC #{new_resource.name} is #{vpc.cidr_block}, but desired CIDR block is #{new_resource.cidr_block}.  VPC CIDR blocks cannot currently be changed!"
     end
   end
+
+  def destroy_aws_object(vpc)
+    if purging
+      vpc.subnets.each do |s|
+        Cheffish.inline_resource(self, action) do
+          aws_subnet s do
+            action :purge
+          end
+        end
+      end
+      # If any of the below resources start needing complicated delete logic (dependent resources needing to
+      # be deleted) move that logic into `delete_aws_resource` and add the purging logic to the resource
+      vpc.network_acls.each       { |o| o.delete unless o.default? }
+      vpc.network_interfaces.each { |o| o.delete }
+      vpc.route_tables.each do |rt|
+        unless rt.main?
+          Cheffish.inline_resource(self, action) do
+            aws_route_table rt do
+              action :purge
+            end
+          end
+        end
+      end
+      vpc.security_groups.each do |sg|
+        unless sg.name == 'default'
+          Cheffish.inline_resource(self, action) do
+            aws_security_group sg do
+              action :purge
+            end
+          end
+        end
+      end
+    end
+
+    # Detach or destroy the internet gateway
+    ig = vpc.internet_gateway
+    if ig
+      converge_by "detach Internet Gateway #{ig.id} in #{region} from #{new_resource.to_s}" do
+        ig.detach(vpc.id)
+      end
+      if ig.tags['OwnedByVPC'] == vpc.id
+        converge_by "destroy Internet Gateway #{ig.id} in #{region} (owned by #{new_resource.to_s})" do
+          ig.delete
+        end
+      end
+    end
+
+    # We cannot delete the main route table, and it will be deleted when the VPC is deleted anyways
+
+    converge_by "delete #{new_resource.to_s} in #{region}" do
+      vpc.delete
+    end
+  end
+
+  private
 
   def update_vpc_attributes(vpc)
     # Figure out what (if anything) we need to update
@@ -93,7 +120,7 @@ class Chef::Provider::AwsVpc < Chef::Provisioning::AWSDriver::AWSProvider
         # enable_dns_support -> enableDnsSupport
         aws_attr_name = name.gsub(/_./) { |v| v[1..1].upcase }
         name = name.to_sym
-        actual_value = driver.ec2.client.describe_vpc_attribute(vpc_id: vpc.id, attribute: aws_attr_name)
+        actual_value = vpc.client.describe_vpc_attribute(vpc_id: vpc.id, attribute: aws_attr_name)
         if actual_value[name][:value] != desired_value
           update_attributes[name] = { old_value: actual_value[name][:value], value: desired_value }
         end
@@ -102,7 +129,7 @@ class Chef::Provider::AwsVpc < Chef::Provisioning::AWSDriver::AWSProvider
 
     update_attributes.each do |name, update|
       converge_by "update #{name} to #{update[:value].inspect} (was #{update[:old_value].inspect}) in VPC #{new_resource.name} (#{vpc.id})" do
-        driver.ec2.client.modify_vpc_attribute(:vpc_id => vpc.id, name => { value: update[:value] })
+        vpc.client.modify_vpc_attribute(:vpc_id => vpc.id, name => { value: update[:value] })
       end
     end
   end
@@ -130,7 +157,10 @@ class Chef::Provider::AwsVpc < Chef::Provisioning::AWSDriver::AWSProvider
     when true
       if !current_ig
         converge_by "attach new Internet Gateway to VPC #{vpc.id}" do
-          current_ig = driver.ec2.internet_gateways.create
+          current_ig = AWS.ec2(config: vpc.config).internet_gateways.create
+          Retryable.retryable(:tries => 15, :sleep => 1, :matching => /never obtained existence/) do
+            raise "internet gateway for VPC #{vpc.id} never obtained existence" unless current_ig.exists?
+          end
           action_handler.report_progress "create Internet Gateway #{current_ig.id}"
           current_ig.tags['OwnedByVPC'] = vpc.id
           action_handler.report_progress "tag Internet Gateway #{current_ig.id} as OwnedByVpc: #{vpc.id}"
@@ -152,27 +182,32 @@ class Chef::Provider::AwsVpc < Chef::Provisioning::AWSDriver::AWSProvider
   end
 
   def update_main_route_table(vpc)
-    main_route_table = Chef::Resource::AwsRouteTable.get_aws_object(new_resource.main_route_table, resource: new_resource)
+    desired_route_table = Chef::Resource::AwsRouteTable.get_aws_object(new_resource.main_route_table, resource: new_resource)
     current_route_table = vpc.route_tables.main_route_table
-    if route_table != main_route_table
+    if current_route_table != desired_route_table
       main_association = current_route_table.associations.select { |a| a.main? }.first
       if !main_association
-        raise "No main route table association found for VPC #{vpc.id}'s current main route table #{main_route_table.id}: error!  Probably a race condition."
+        raise "No main route table association found for #{new_resource.to_s} current main route table #{current_route_table.id}: error!  Probably a race condition."
       end
-      converge_by "change main route table for VPC #{vpc.id} to #{route_table.id} (was #{main_route_table.id})" do
-        aws_driver.ec2.client.replace_route_table_association(
+      converge_by "change main route table for #{new_resource.to_s} to #{desired_route_table.id} (was #{current_route_table.id})" do
+        vpc.client.replace_route_table_association(
           association_id: main_association.id,
-          route_table_id: main_route_table.id)
+          route_table_id: desired_route_table.id
+        )
       end
     end
-    main_route_table
+    desired_route_table
   end
 
   def update_main_routes(vpc, main_route_table)
+    # If no route table is provided and we fetch the current main one from AWS,
+    # there is no guarantee that is the 'default' route table created when
+    # creating the VPC
     main_route_table ||= vpc.route_tables.main_route_table
+    main_routes = new_resource.main_routes
     aws_route_table main_route_table do
       vpc vpc
-      routes new_resource.main_routes
+      routes main_routes
     end
     main_route_table
   end
@@ -181,7 +216,7 @@ class Chef::Provider::AwsVpc < Chef::Provisioning::AWSDriver::AWSProvider
     dhcp_options = vpc.dhcp_options
     desired_dhcp_options = Chef::Resource::AwsDhcpOptions.get_aws_object(new_resource.dhcp_options, resource: new_resource)
     if dhcp_options != desired_dhcp_options
-      converge_by "change DHCP options for VPC #{new_resource.name} (#{vpc.id}) to #{new_resource.dhcp_options} (#{desired_dhcp_options.id}) - was #{dhcp_options.id}" do
+      converge_by "change DHCP options for #{new_resource.to_s} to #{new_resource.dhcp_options} (#{desired_dhcp_options.id}) - was #{dhcp_options.id}" do
         vpc.dhcp_options = desired_dhcp_options
       end
     end

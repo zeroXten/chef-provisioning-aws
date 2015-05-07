@@ -10,8 +10,11 @@ require 'chef/provisioning/machine/windows_machine'
 require 'chef/provisioning/machine/unix_machine'
 require 'chef/provisioning/machine_spec'
 
-require 'chef/provider/aws_key_pair'
 require 'chef/resource/aws_key_pair'
+require 'chef/resource/aws_instance'
+require 'chef/resource/aws_image'
+require 'chef/resource/aws_load_balancer'
+require 'chef/provisioning/aws_driver/aws_resource'
 require 'chef/provisioning/aws_driver/version'
 require 'chef/provisioning/aws_driver/credentials'
 
@@ -50,7 +53,10 @@ module AWSDriver
       @aws_config = AWS.config(
         access_key_id:     credentials[:aws_access_key_id],
         secret_access_key: credentials[:aws_secret_access_key],
-        region: region || credentials[:region]
+        region: region || credentials[:region],
+        proxy_uri: credentials[:proxy_uri] || nil,
+        session_token: credentials[:aws_session_token] || nil,
+        logger: Chef::Log.logger
       )
     end
 
@@ -64,7 +70,6 @@ module AWSDriver
 
       old_elb = nil
       actual_elb = load_balancer_for(lb_spec)
-      puts "Actual #{actual_elb.inspect} for #{lb_spec.reference}"
       if !actual_elb || !actual_elb.exists?
         lb_options[:listeners] ||= get_listeners(:http)
         if !lb_options[:subnets] && !lb_options[:availability_zones] && machine_specs
@@ -85,10 +90,10 @@ module AWSDriver
           actual_elb = elb.load_balancers.create(lb_spec.name, lb_options)
 
           lb_spec.reference = {
-            'driver_url' => driver_url,
             'driver_version' => Chef::Provisioning::AWSDriver::VERSION,
             'allocated_at' => Time.now.utc.to_s,
           }
+          lb_spec.driver_url = driver_url
         end
       else
         # Header gets printed the first time we make an update
@@ -168,7 +173,7 @@ module AWSDriver
               desired_subnets_zones[default_subnet[:subnet_id]] = zone
             end
           end
-          unless lb_options[:subnets] && lb_options[:subnets.empty?]
+          unless lb_options[:subnets].nil? || lb_options[:subnets].empty?
             subnet_query = ec2.client.describe_subnets(:subnet_ids => lb_options[:subnets])[:subnet_set]
             # AWS raises an error on an unknown subnet, but not an unknown AZ
             subnet_query.each do |subnet|
@@ -328,12 +333,13 @@ module AWSDriver
           image_options[:description] ||= "Image #{image_spec.name} created from machine #{machine_spec.name}"
           Chef::Log.debug "AWS Image options: #{image_options.inspect}"
           image = ec2.images.create(image_options.to_hash)
+          image.add_tag('From-Instance', :value => image_options[:instance_id]) if image_options[:instance_id]
           image_spec.reference = {
-            'driver_url' => driver_url,
             'driver_version' => Chef::Provisioning::AWSDriver::VERSION,
             'image_id' => image.id,
             'allocated_at' => Time.now.to_i
           }
+          image_spec.driver_url = driver_url
         end
       end
     end
@@ -353,22 +359,12 @@ module AWSDriver
     end
 
     def destroy_image(action_handler, image_spec, image_options)
-      actual_image = image_for(image_spec)
-      if actual_image.nil? || !actual_image.exists?
-        Chef::Log.warn "Image #{image_spec.name} doesn't exist"
-      else
-        snapshots = actual_image.block_device_mappings.map do |dev, opts|
-          ec2.snapshots[opts[:snapshot_id]]
-        end
-        action_handler.perform_action "De-registering image #{image_spec.name}" do
-          actual_image.deregister
-        end
-        if snapshots.any?
-          action_handler.perform_action "Deleting image #{image_spec.name} snapshots" do
-            snapshots.each do |snap|
-              snap.delete
-            end
-          end
+      # TODO the driver should automatically be set by `inline_resource`
+      d = self
+      Provisioning.inline_resource(action_handler) do
+        aws_image image_spec.name do
+          action :destroy
+          driver d
         end
       end
     end
@@ -408,14 +404,15 @@ EOD
           sleep 5 while instance.status == :pending
           # TODO add other tags identifying user / node url (same as fog)
           instance.tags['Name'] = machine_spec.name
+          instance.source_dest_check = machine_options[:source_dest_check] if machine_options.has_key?(:source_dest_check)
           machine_spec.reference = {
-              'driver_url' => driver_url,
               'driver_version' => Chef::Provisioning::AWSDriver::VERSION,
               'allocated_at' => Time.now.utc.to_s,
               'host_node' => action_handler.host_node,
               'image_id' => bootstrap_options[:image_id],
               'instance_id' => instance.id
           }
+          machine_spec.driver_url = driver_url
           machine_spec.reference['key_name'] = bootstrap_options[:key_name] if bootstrap_options[:key_name]
           %w(is_windows ssh_username sudo use_private_ip_for_ssh ssh_gateway).each do |key|
             machine_spec.reference[key] = machine_options[key.to_sym] if machine_options[key.to_sym]
@@ -425,9 +422,7 @@ EOD
     end
 
     def allocate_machines(action_handler, specs_and_options, parallelizer)
-      #Chef::Log.warn("#{specs_and_options}")
       create_servers(action_handler, specs_and_options, parallelizer) do |machine_spec, server|
-    #Chef::Log.warn("#{machine_spec}")
         yield machine_spec
       end
       specs_and_options.keys
@@ -465,17 +460,15 @@ EOD
     end
 
     def destroy_machine(action_handler, machine_spec, machine_options)
-      instance = instance_for(machine_spec)
-      if instance && instance.exists?
-        # TODO do we need to wait_until(action_handler, machine_spec, instance) { instance.status != :shutting_down } ?
-        action_handler.perform_action "Terminate #{machine_spec.name} (#{machine_spec.reference['instance_id']}) in #{aws_config.region} ..." do
-          instance.terminate
-          machine_spec.reference = nil
+      d = self
+      Provisioning.inline_resource(action_handler) do
+        aws_instance machine_spec.name do
+          action :destroy
+          driver d
         end
-      else
-        Chef::Log.warn "Instance #{machine_spec.reference['instance_id']} doesn't exist for #{machine_spec.name}"
       end
 
+      # TODO move this into the aws_instance provider somehow
       strategy = convergence_strategy_for(machine_spec, machine_options)
       strategy.cleanup_convergence(action_handler, machine_spec)
     end
@@ -558,6 +551,7 @@ EOD
 
     def bootstrap_options_for(action_handler, machine_spec, machine_options)
       bootstrap_options = (machine_options[:bootstrap_options] || {}).to_h.dup
+      bootstrap_options[:instance_type] ||= default_instance_type
       image_id = bootstrap_options[:image_id] || machine_options[:image_id] || default_ami_for_region(aws_config.region)
       bootstrap_options[:image_id] = image_id
       if !bootstrap_options[:key_name]
@@ -598,8 +592,8 @@ EOD
 
     def instance_for(machine_spec)
       if machine_spec.reference
-        if machine_spec.reference['driver_url'] != driver_url
-          raise "Switching a machine's driver from #{machine_spec.reference['driver_url']} to #{driver_url} is not currently supported!  Use machine :destroy and then re-create the machine on the new driver."
+        if machine_spec.driver_url != driver_url
+          raise "Switching a machine's driver from #{machine_spec.driver_url} to #{driver_url} is not currently supported!  Use machine :destroy and then re-create the machine on the new driver."
         end
         Chef::Resource::AwsInstance.get_aws_object(machine_spec.reference['instance_id'], driver: self, managed_entry_store: machine_spec.managed_entry_store, required: false)
       end
@@ -645,23 +639,23 @@ EOD
 
       case region
         when 'ap-northeast-1'
-          'ami-c786dcc6'
+          'ami-6cbca76d'
         when 'ap-southeast-1'
-          'ami-eefca7bc'
+          'ami-04c6ec56'
         when 'ap-southeast-2'
-          'ami-996706a3'
+          'ami-c9eb9ff3'
         when 'eu-west-1'
-          'ami-4ab46b3d'
+          'ami-5f9e1028'
         when 'eu-central-1'
-          'ami-7c3c0a61'
+          'ami-56c2f14b'
         when 'sa-east-1'
-          'ami-6770d87a'
+          'ami-81f14e9c'
         when 'us-east-1'
-          'ami-d2ff23ba'
+          'ami-12793a7a'
         when 'us-west-1'
-          'ami-73717d36'
+          'ami-6ebca42b'
         when 'us-west-2'
-          'ami-f1ce8bc1'
+          'ami-b9471c89'
         else
           raise 'Unsupported region!'
       end
@@ -809,16 +803,16 @@ EOD
       image ||= image_for(image_spec)
       time_elapsed = 0
       sleep_time = 10
-      max_wait_time = 120
+      max_wait_time = 300
       if !yield(image)
         action_handler.report_progress "waiting for #{image_spec.name} (#{image.id} on #{driver_url}) to be ready ..."
-        while time_elapsed < 120 && !yield(image)
+        while time_elapsed < max_wait_time && !yield(image)
           action_handler.report_progress "been waiting #{time_elapsed}/#{max_wait_time} -- sleeping #{sleep_time} seconds for #{image_spec.name} (#{image.id} on #{driver_url}) to be ready ..."
           sleep(sleep_time)
           time_elapsed += sleep_time
         end
         unless yield(image)
-          raise "Image #{image.id} did not become ready within 120 seconds"
+          raise "Image #{image.id} did not become ready within #{max_wait_time} seconds"
         end
         action_handler.report_progress "Image #{image_spec.name} is now ready"
       end
@@ -836,13 +830,13 @@ EOD
       if !yield(instance)
         if action_handler.should_perform_actions
           action_handler.report_progress "waiting for #{machine_spec.name} (#{instance.id} on #{driver_url}) to be ready ..."
-          while time_elapsed < 120 && !yield(instance)
+          while time_elapsed < max_wait_time && !yield(instance)
             action_handler.report_progress "been waiting #{time_elapsed}/#{max_wait_time} -- sleeping #{sleep_time} seconds for #{machine_spec.name} (#{instance.id} on #{driver_url}) to be ready ..."
             sleep(sleep_time)
             time_elapsed += sleep_time
           end
           unless yield(instance)
-            raise "Image #{instance.id} did not become ready within 120 seconds"
+            raise "Image #{instance.id} did not become ready within #{max_wait_time} seconds"
           end
           action_handler.report_progress "#{machine_spec.name} is now ready"
         end
@@ -858,7 +852,7 @@ EOD
       unless transport.available?
         if action_handler.should_perform_actions
           action_handler.report_progress "waiting for #{machine_spec.name} (#{instance.id} on #{driver_url}) to be connectable (transport up and running) ..."
-          while time_elapsed < 120 && !transport.available?
+          while time_elapsed < max_wait_time && !transport.available?
             action_handler.report_progress "been waiting #{time_elapsed}/#{max_wait_time} -- sleeping #{sleep_time} seconds for #{machine_spec.name} (#{instance.id} on #{driver_url}) to be connectable ..."
             sleep(sleep_time)
             time_elapsed += sleep_time
@@ -937,14 +931,15 @@ EOD
             machine_spec = machine_specs.pop
             machine_options = specs_and_options[machine_spec]
             machine_spec.reference = {
-              'driver_url' => driver_url,
               'driver_version' => Chef::Provisioning::AWSDriver::VERSION,
               'allocated_at' => Time.now.utc.to_s,
               'host_node' => action_handler.host_node,
               'image_id' => bootstrap_options[:image_id],
               'instance_id' => instance.id
             }
+            machine_spec.driver_url = driver_url
             instance.tags['Name'] = machine_spec.name
+            instance.source_dest_check = machine_options[:source_dest_check] if machine_options.has_key?(:source_dest_check)
             machine_spec.reference['key_name'] = bootstrap_options[:key_name] if bootstrap_options[:key_name]
             %w(is_windows ssh_username sudo use_private_ip_for_ssh ssh_gateway).each do |key|
               machine_spec.reference[key] = machine_options[key.to_sym] if machine_options[key.to_sym]
@@ -1029,7 +1024,7 @@ EOD
     end
 
     def default_instance_type
-      't1.micro'
+      't2.micro'
     end
 
     PORT_DEFAULTS = {

@@ -17,18 +17,14 @@ end
 
 aws_security_group 'ref-sg1' do
   vpc 'ref-vpc'
-  inbound_rules [ { ports: 22, protocol: :tcp, sources: [ '0.0.0.0/0' ] } ]
+  inbound_rules '0.0.0.0/0' => 22
 end
 
 aws_security_group 'ref-sg2' do
   vpc 'ref-vpc'
 
-  inbound_rules [
-    {:ports => 2223, :protocol => :tcp, :sources => ['ref-sg1'] }
-  ]
-  outbound_rules [
-    {:ports => 2223, :protocol => :tcp, :destinations => ['ref-sg1'] }
-  ]
+  inbound_rules 'ref-sg1' => 2224
+  outbound_rules 2224 => 'ref-sg1'
 end
 
 aws_route_table 'ref-public' do
@@ -79,11 +75,11 @@ aws_auto_scaling_group 'ref-auto-scaling-group' do
 end
 
 aws_ebs_volume 'ref-volume' do
-  availability_zone 'eu-west-1a'
+  availability_zone 'a'
   size 1
+  machine 'ref-machine1'
+  device '/dev/xvdf'
 end
-
-# attach above volume to machine somehow ...
 
 aws_eip_address 'ref-elastic-ip' do
   machine 'ref-machine1'
